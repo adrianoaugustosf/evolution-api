@@ -304,6 +304,32 @@ export const reactionMessageSchema: JSONSchema7 = {
   required: ['key', 'reaction'],
 };
 
+export const forwardMessageSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    forwarding: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            remoteJid: { type: 'string' },
+            fromMe: { type: 'boolean', enum: [true, false] },
+            participant: { type: 'string' },
+          },
+          required: ['id', 'remoteJid', 'fromMe'],
+          ...isNotEmpty('id', 'remoteJid'),
+        },
+      },
+      required: ['key'],
+    },
+  },
+  required: ['number', 'forwarding'],
+};
+
 export const pollMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

@@ -167,3 +167,12 @@ export class SendReactionDto {
   key: proto.IMessageKey;
   reaction: string;
 }
+
+export class ForwardingMessageDto {
+  key: proto.IMessageKey;
+}
+
+export class SendForwardMessageDto {
+  number: string;
+  forwarding: ForwardingMessageDto;
+}

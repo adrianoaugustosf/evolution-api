@@ -3,6 +3,7 @@ import {
   SendAudioDto,
   SendButtonsDto,
   SendContactDto,
+  SendForwardMessageDto,
   SendListDto,
   SendLocationDto,
   SendMediaDto,
@@ -95,6 +96,10 @@ export class SendMessageController {
       throw new BadRequestException('Reaction must be a single emoji or empty string');
     }
     return await this.waMonitor.waInstances[instanceName].reactionMessage(data);
+  }
+
+  public async forwardMessage({ instanceName }: InstanceDto, data: SendForwardMessageDto) {
+    return await this.waMonitor.waInstances[instanceName].forwardMessage(data);
   }
 
   public async sendPoll({ instanceName }: InstanceDto, data: SendPollDto) {

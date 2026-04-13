@@ -40,6 +40,7 @@ import {
   SendAudioDto,
   SendButtonsDto,
   SendContactDto,
+  SendForwardMessageDto,
   SendListDto,
   SendLocationDto,
   SendMediaDto,
@@ -104,6 +105,8 @@ import makeWASocket, {
   DisconnectReason,
   downloadContentFromMessage,
   downloadMediaMessage,
+  generateForwardMessageContent,
+  generateMessageID,
   generateWAMessageFromContent,
   getAggregateVotesInPollMessage,
   GetCatalogOptions,
@@ -3501,6 +3504,53 @@ export class BaileysStartupService extends ChannelStartupService {
     return await this.sendMessageWithTyping(data.key.remoteJid, {
       reactionMessage: { key: data.key, text: data.reaction },
     });
+  }
+
+  public async forwardMessage(data: SendForwardMessageDto) {
+    const jid = createJid(data.number);
+    const originalMessage = (await this.getMessage(data.forwarding.key, true)) as proto.IWebMessageInfo | undefined;
+
+    if (!originalMessage?.message) {
+      throw new NotFoundException('Message not found in store');
+    }
+
+    const forwardContent = generateForwardMessageContent(originalMessage as WAMessage, false);
+    const contentType = getContentType(forwardContent);
+
+    if (!contentType || !forwardContent?.[contentType]) {
+      throw new BadRequestException('Unable to generate forward content');
+    }
+
+    const content = forwardContent[contentType] as any;
+    const message = {
+      ...forwardContent,
+      [contentType]: {
+        ...content,
+        contextInfo: {
+          ...content?.contextInfo,
+          isForwarded: true,
+          forwardingScore: 1,
+        },
+      },
+    } as proto.IMessage;
+
+    const messageId = generateMessageID();
+    const forwardedMessage = generateWAMessageFromContent(jid, message, {
+      timestamp: new Date(),
+      userJid: this.instance.wuid,
+      messageId,
+    });
+
+    await this.client.relayMessage(jid, forwardedMessage.message as proto.IMessage, { messageId });
+
+    forwardedMessage.key = {
+      id: messageId,
+      remoteJid: jid,
+      participant: isPnUser(jid) ? jid : undefined,
+      fromMe: true,
+    };
+
+    return forwardedMessage;
   }
 
   // Chat Controller
