@@ -1,0 +1,205 @@
+From b6b5529f6689d4cb142601e2f1522fffccbbffbc Mon Sep 17 00:00:00 2001
+From: adrianoaugustosf <adriano.aasf@gmail.com>
+Date: Mon, 13 Apr 2026 20:29:39 -0300
+Subject: [PATCH] feat(message): add forward message endpoint
+
+---
+ src/api/controllers/sendMessage.controller.ts |  5 ++
+ src/api/dto/sendMessage.dto.ts                |  9 ++++
+ .../whatsapp/whatsapp.baileys.service.ts      | 50 +++++++++++++++++++
+ src/api/routes/sendMessage.router.ts          | 12 +++++
+ src/validate/message.schema.ts                | 26 ++++++++++
+ 5 files changed, 102 insertions(+)
+
+diff --git a/src/api/controllers/sendMessage.controller.ts b/src/api/controllers/sendMessage.controller.ts
+index 64aa1c84..df78ac60 100644
+--- a/src/api/controllers/sendMessage.controller.ts
++++ b/src/api/controllers/sendMessage.controller.ts
+@@ -3,6 +3,7 @@ import {
+   SendAudioDto,
+   SendButtonsDto,
+   SendContactDto,
++  SendForwardMessageDto,
+   SendListDto,
+   SendLocationDto,
+   SendMediaDto,
+@@ -97,6 +98,10 @@ export class SendMessageController {
+     return await this.waMonitor.waInstances[instanceName].reactionMessage(data);
+   }
+ 
++  public async forwardMessage({ instanceName }: InstanceDto, data: SendForwardMessageDto) {
++    return await this.waMonitor.waInstances[instanceName].forwardMessage(data);
++  }
++
+   public async sendPoll({ instanceName }: InstanceDto, data: SendPollDto) {
+     return await this.waMonitor.waInstances[instanceName].pollMessage(data);
+   }
+diff --git a/src/api/dto/sendMessage.dto.ts b/src/api/dto/sendMessage.dto.ts
+index ba9ecf52..ec82514f 100644
+--- a/src/api/dto/sendMessage.dto.ts
++++ b/src/api/dto/sendMessage.dto.ts
+@@ -167,3 +167,12 @@ export class SendReactionDto {
+   key: proto.IMessageKey;
+   reaction: string;
+ }
++
++export class ForwardingMessageDto {
++  key: proto.IMessageKey;
++}
++
++export class SendForwardMessageDto {
++  number: string;
++  forwarding: ForwardingMessageDto;
++}
+diff --git a/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts b/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
+index 60e857fc..e86617a4 100644
+--- a/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
++++ b/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
+@@ -40,6 +40,7 @@ import {
+   SendAudioDto,
+   SendButtonsDto,
+   SendContactDto,
++  SendForwardMessageDto,
+   SendListDto,
+   SendLocationDto,
+   SendMediaDto,
+@@ -104,6 +105,8 @@ import makeWASocket, {
+   DisconnectReason,
+   downloadContentFromMessage,
+   downloadMediaMessage,
++  generateForwardMessageContent,
++  generateMessageID,
+   generateWAMessageFromContent,
+   getAggregateVotesInPollMessage,
+   GetCatalogOptions,
+@@ -3503,6 +3506,53 @@ export class BaileysStartupService extends ChannelStartupService {
+     });
+   }
+ 
++  public async forwardMessage(data: SendForwardMessageDto) {
++    const jid = createJid(data.number);
++    const originalMessage = (await this.getMessage(data.forwarding.key, true)) as proto.IWebMessageInfo | undefined;
++
++    if (!originalMessage?.message) {
++      throw new NotFoundException('Message not found in store');
++    }
++
++    const forwardContent = generateForwardMessageContent(originalMessage as WAMessage, false);
++    const contentType = getContentType(forwardContent);
++
++    if (!contentType || !forwardContent?.[contentType]) {
++      throw new BadRequestException('Unable to generate forward content');
++    }
++
++    const content = forwardContent[contentType] as any;
++    const message = {
++      ...forwardContent,
++      [contentType]: {
++        ...content,
++        contextInfo: {
++          ...content?.contextInfo,
++          isForwarded: true,
++          forwardingScore: 1,
++        },
++      },
++    } as proto.IMessage;
++
++    const messageId = generateMessageID();
++    const forwardedMessage = generateWAMessageFromContent(jid, message, {
++      timestamp: new Date(),
++      userJid: this.instance.wuid,
++      messageId,
++    });
++
++    await this.client.relayMessage(jid, forwardedMessage.message as proto.IMessage, { messageId });
++
++    forwardedMessage.key = {
++      id: messageId,
++      remoteJid: jid,
++      participant: isPnUser(jid) ? jid : undefined,
++      fromMe: true,
++    };
++
++    return forwardedMessage;
++  }
++
+   // Chat Controller
+   public async whatsappNumber(data: WhatsAppNumberDto) {
+     const jids: {
+diff --git a/src/api/routes/sendMessage.router.ts b/src/api/routes/sendMessage.router.ts
+index cd073dba..2f338961 100644
+--- a/src/api/routes/sendMessage.router.ts
++++ b/src/api/routes/sendMessage.router.ts
+@@ -3,6 +3,7 @@ import {
+   SendAudioDto,
+   SendButtonsDto,
+   SendContactDto,
++  SendForwardMessageDto,
+   SendListDto,
+   SendLocationDto,
+   SendMediaDto,
+@@ -19,6 +20,7 @@ import {
+   audioMessageSchema,
+   buttonsMessageSchema,
+   contactMessageSchema,
++  forwardMessageSchema,
+   listMessageSchema,
+   locationMessageSchema,
+   mediaMessageSchema,
+@@ -152,6 +154,16 @@ export class MessageRouter extends RouterBroker {
+ 
+         return res.status(HttpStatus.CREATED).json(response);
+       })
++      .post(this.routerPath('forwardMessage'), ...guards, async (req, res) => {
++        const response = await this.dataValidate<SendForwardMessageDto>({
++          request: req,
++          schema: forwardMessageSchema,
++          ClassRef: SendForwardMessageDto,
++          execute: (instance, data) => sendMessageController.forwardMessage(instance, data),
++        });
++
++        return res.status(HttpStatus.CREATED).json(response);
++      })
+       .post(this.routerPath('sendPoll'), ...guards, async (req, res) => {
+         const response = await this.dataValidate<SendPollDto>({
+           request: req,
+diff --git a/src/validate/message.schema.ts b/src/validate/message.schema.ts
+index d514c619..5c181e55 100644
+--- a/src/validate/message.schema.ts
++++ b/src/validate/message.schema.ts
+@@ -304,6 +304,32 @@ export const reactionMessageSchema: JSONSchema7 = {
+   required: ['key', 'reaction'],
+ };
+ 
++export const forwardMessageSchema: JSONSchema7 = {
++  $id: v4(),
++  type: 'object',
++  properties: {
++    number: { ...numberDefinition },
++    forwarding: {
++      type: 'object',
++      properties: {
++        key: {
++          type: 'object',
++          properties: {
++            id: { type: 'string' },
++            remoteJid: { type: 'string' },
++            fromMe: { type: 'boolean', enum: [true, false] },
++            participant: { type: 'string' },
++          },
++          required: ['id', 'remoteJid', 'fromMe'],
++          ...isNotEmpty('id', 'remoteJid'),
++        },
++      },
++      required: ['key'],
++    },
++  },
++  required: ['number', 'forwarding'],
++};
++
+ export const pollMessageSchema: JSONSchema7 = {
+   $id: v4(),
+   type: 'object',
+-- 
+2.51.0.windows.1
+
