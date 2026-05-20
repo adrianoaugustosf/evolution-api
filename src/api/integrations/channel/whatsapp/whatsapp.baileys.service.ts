@@ -34,6 +34,7 @@ import { HandleLabelDto, LabelDto } from '@api/dto/label.dto';
 import {
   Button,
   ContactMessage,
+  ForwardExternalAdReplyDto,
   KeyType,
   MediaMessage,
   Options,
@@ -112,6 +113,7 @@ import makeWASocket, {
   GetCatalogOptions,
   getContentType,
   getDevice,
+  getUrlInfo,
   GroupMetadata,
   isJidBroadcast,
   isJidGroup,
@@ -3508,10 +3510,71 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async forwardMessage(data: SendForwardMessageDto) {
     const jid = createJid(data.number);
-    const originalMessage = (await this.getMessage(data.forwarding.key, true)) as proto.IWebMessageInfo | undefined;
+    const storedOriginalMessage = (await this.getMessage(data.forwarding.key, true)) as
+      | proto.IWebMessageInfo
+      | undefined;
 
-    if (!originalMessage?.message) {
+    if (!storedOriginalMessage?.message) {
       throw new NotFoundException('Message not found in store');
+    }
+
+    const payloadExternalAdReply = await this.normalizeForwardExternalAdReply(data.forwarding?.externalAdReply);
+    const storedMessageWithContext = await this.hydrateStoredForwardMessage(storedOriginalMessage);
+    const storedUnwrappedMessage = unwrapForwardSourceMessage(storedMessageWithContext.message);
+    const storedContextInfo = getMessageContextInfo(storedUnwrappedMessage);
+    const originalMessage = await this.hydrateStoredForwardMessage(storedOriginalMessage, payloadExternalAdReply);
+    const unwrappedOriginalMessage = unwrapForwardSourceMessage(originalMessage.message);
+    const originalContextInfo = getMessageContextInfo(unwrappedOriginalMessage);
+    const originalForwardText = extractForwardSourceText(unwrappedOriginalMessage);
+    const isTextSourceMessage = isForwardTextSourceMessage(unwrappedOriginalMessage);
+    const forwardScore = Math.max(Number(originalContextInfo?.forwardingScore ?? 0), 1);
+    const forwardMessageId = data.forwarding.key.id;
+
+    this.logger.info(
+      `Forward message ${forwardMessageId}: payload diagnostics ${JSON.stringify({
+        rawExternalAdReply: summarizeForwardExternalAdReply(data.forwarding?.externalAdReply),
+        normalizedExternalAdReply: summarizeForwardExternalAdReply(payloadExternalAdReply),
+        sourceMessageType: getContentType(unwrappedOriginalMessage) ?? 'unknown',
+        sourceHasStorePreview: Boolean(storedContextInfo?.externalAdReply),
+        sourceHasMergedPreview: Boolean(originalContextInfo?.externalAdReply),
+        sourceHasUrl: Boolean(originalForwardText && extractUrlFromText(originalForwardText)),
+      })}`,
+    );
+
+    if (payloadExternalAdReply && originalForwardText && isTextSourceMessage) {
+      this.logger.info(
+        `Forward message ${forwardMessageId}: using payload externalAdReply preview without forwarded flag`,
+      );
+      return await this.sendForwardedTextWithGeneratedPreview(
+        jid,
+        originalForwardText,
+        {
+          ...originalContextInfo,
+          isForwarded: true,
+          forwardingScore: forwardScore,
+        },
+        false,
+      );
+    }
+
+    if (!originalContextInfo?.externalAdReply && originalForwardText && extractUrlFromText(originalForwardText)) {
+      this.logger.info(`Forward message ${forwardMessageId}: generating preview from URL fallback`);
+      return await this.sendForwardedTextWithGeneratedPreview(jid, originalForwardText, {
+        ...originalContextInfo,
+        isForwarded: true,
+        forwardingScore: forwardScore,
+      });
+    }
+
+    if (originalContextInfo?.externalAdReply) {
+      const previewSource = payloadExternalAdReply
+        ? 'payload'
+        : storedContextInfo?.externalAdReply
+          ? 'store'
+          : 'generated';
+      this.logger.info(`Forward message ${forwardMessageId}: using ${previewSource} preview metadata`);
+    } else {
+      this.logger.warn(`Forward message ${forwardMessageId}: sending without preview metadata`);
     }
 
     const forwardContent = generateForwardMessageContent(originalMessage as WAMessage, false);
@@ -3522,14 +3585,18 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const content = forwardContent[contentType] as any;
+    const mergedContextInfo = mergeForwardContextInfo(originalContextInfo, content?.contextInfo);
     const message = {
       ...forwardContent,
       [contentType]: {
         ...content,
         contextInfo: {
-          ...content?.contextInfo,
+          ...mergedContextInfo,
           isForwarded: true,
-          forwardingScore: 1,
+          forwardingScore: Math.max(
+            Number(content?.contextInfo?.forwardingScore ?? originalContextInfo?.forwardingScore ?? 0),
+            1,
+          ),
         },
       },
     } as proto.IMessage;
@@ -3551,6 +3618,183 @@ export class BaileysStartupService extends ChannelStartupService {
     };
 
     return forwardedMessage;
+  }
+
+  private async sendForwardedTextWithGeneratedPreview(
+    jid: string,
+    text: string,
+    contextInfo: any,
+    markAsForwarded = true,
+  ) {
+    const enrichedContextInfo = contextInfo?.externalAdReply
+      ? contextInfo
+      : await this.buildForwardedLinkPreviewContext(text, contextInfo);
+    let ephemeralExpiration: number | undefined;
+
+    if (isJidGroup(jid)) {
+      try {
+        const cache = this.configService.get<CacheConf>('CACHE');
+        const group =
+          !cache.REDIS.ENABLED && !cache.LOCAL.ENABLED
+            ? await this.findGroup({ groupJid: jid }, 'inner')
+            : await this.getGroupMetadataCache(jid);
+
+        ephemeralExpiration = group?.ephemeralDuration;
+      } catch {
+        ephemeralExpiration = undefined;
+      }
+    }
+
+    const messageId = generateMessageID();
+    const relayContextInfo = { ...(enrichedContextInfo ?? {}) };
+
+    if (markAsForwarded) {
+      relayContextInfo.isForwarded = true;
+      relayContextInfo.forwardingScore = Math.max(Number(enrichedContextInfo?.forwardingScore ?? 0), 1);
+    } else {
+      delete relayContextInfo.isForwarded;
+      delete relayContextInfo.forwardingScore;
+    }
+
+    const message = {
+      extendedTextMessage: {
+        text,
+        contextInfo: relayContextInfo,
+      },
+    } as proto.IMessage;
+
+    const forwardedMessage = generateWAMessageFromContent(jid, message, {
+      timestamp: new Date(),
+      userJid: this.instance.wuid,
+      messageId,
+      ephemeralExpiration,
+    } as any);
+
+    await this.client.relayMessage(jid, forwardedMessage.message as proto.IMessage, { messageId });
+
+    forwardedMessage.key = {
+      id: messageId,
+      remoteJid: jid,
+      participant: isPnUser(jid) ? jid : undefined,
+      fromMe: true,
+    };
+
+    return forwardedMessage;
+  }
+
+  private async buildForwardedLinkPreviewContext(text: string, contextInfo: any) {
+    const url = extractUrlFromText(text);
+    if (!url) {
+      return contextInfo;
+    }
+
+    try {
+      const resolvedUrl = await this.resolvePreviewUrl(url);
+      const urlInfo = await getUrlInfo(resolvedUrl, {
+        thumbnailWidth: 192,
+        fetchOpts: {
+          timeout: 5000,
+          headers: {
+            'user-agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+          },
+        },
+        uploadImage: this.client.waUploadToServer,
+      });
+
+      if (!urlInfo?.title) {
+        return contextInfo;
+      }
+
+      const externalAdReply = {
+        title: urlInfo.title,
+        body: urlInfo.description,
+        sourceUrl: urlInfo['canonical-url'] || resolvedUrl,
+        mediaUrl: urlInfo['canonical-url'] || resolvedUrl,
+        thumbnailUrl: urlInfo.originalThumbnailUrl,
+        mediaType: 1,
+        showAdAttribution: false,
+        renderLargerThumbnail: true,
+        jpegThumbnail: urlInfo.jpegThumbnail ? Uint8Array.from(urlInfo.jpegThumbnail) : undefined,
+      };
+
+      return mergeForwardContextInfo(contextInfo, { externalAdReply });
+    } catch (error) {
+      this.logger.warn(`Unable to generate forwarded link preview: ${error?.message || error}`);
+      return contextInfo;
+    }
+  }
+
+  private async resolvePreviewUrl(url: string) {
+    try {
+      const response = await axios.get(url, {
+        maxRedirects: 5,
+        timeout: 5000,
+        validateStatus: () => true,
+        headers: {
+          'user-agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+        },
+      });
+
+      const finalUrl = response?.request?.res?.responseUrl;
+      return typeof finalUrl === 'string' && finalUrl.startsWith('http') ? finalUrl : url;
+    } catch {
+      return url;
+    }
+  }
+
+  private async hydrateStoredForwardMessage(
+    storedMessage: proto.IWebMessageInfo,
+    externalAdReply?: any,
+  ): Promise<proto.IWebMessageInfo> {
+    const message = this.deserializeMessageBuffers(storedMessage.message);
+    const storedContextInfo = this.deserializeMessageBuffers((storedMessage as any).contextInfo);
+    const mergedContextInfo = mergeForwardContextInfo(
+      storedContextInfo,
+      externalAdReply ? { externalAdReply } : undefined,
+    );
+
+    return {
+      ...storedMessage,
+      key: this.deserializeMessageBuffers(storedMessage.key),
+      message: restoreStoredMessageContextInfo(message, mergedContextInfo),
+    };
+  }
+
+  private async normalizeForwardExternalAdReply(externalAdReply?: ForwardExternalAdReplyDto) {
+    if (!externalAdReply) {
+      return undefined;
+    }
+
+    const normalizedExternalAdReply = this.deserializeMessageBuffers({ ...externalAdReply });
+
+    if (!normalizedExternalAdReply.thumbnailUrl && typeof normalizedExternalAdReply.thumbnail === 'string') {
+      normalizedExternalAdReply.thumbnailUrl = normalizedExternalAdReply.thumbnail;
+    }
+
+    if (typeof normalizedExternalAdReply.jpegThumbnail === 'string') {
+      try {
+        normalizedExternalAdReply.jpegThumbnail = Uint8Array.from(
+          Buffer.from(normalizedExternalAdReply.jpegThumbnail, 'base64'),
+        );
+      } catch {
+        delete normalizedExternalAdReply.jpegThumbnail;
+      }
+    }
+
+    if (!normalizedExternalAdReply.jpegThumbnail && normalizedExternalAdReply.thumbnailUrl) {
+      try {
+        const response = await axios.get(normalizedExternalAdReply.thumbnailUrl, {
+          responseType: 'arraybuffer',
+        });
+        normalizedExternalAdReply.jpegThumbnail = Uint8Array.from(Buffer.from(response.data));
+      } catch (error) {
+        this.logger.warn(`Unable to fetch externalAdReply thumbnail: ${error?.message || error}`);
+      }
+    }
+
+    return normalizedExternalAdReply;
   }
 
   // Chat Controller
@@ -5169,4 +5413,203 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
   }
+}
+
+function unwrapForwardSourceMessage(message: proto.IMessage | null | undefined): proto.IMessage | undefined {
+  if (!message) {
+    return undefined;
+  }
+
+  if (message.ephemeralMessage?.message) {
+    return unwrapForwardSourceMessage(message.ephemeralMessage.message);
+  }
+
+  if (message.viewOnceMessage?.message) {
+    return unwrapForwardSourceMessage(message.viewOnceMessage.message);
+  }
+
+  if (message.viewOnceMessageV2?.message) {
+    return unwrapForwardSourceMessage(message.viewOnceMessageV2.message);
+  }
+
+  if (message.viewOnceMessageV2Extension?.message) {
+    return unwrapForwardSourceMessage(message.viewOnceMessageV2Extension.message);
+  }
+
+  if (message.documentWithCaptionMessage?.message) {
+    return unwrapForwardSourceMessage(message.documentWithCaptionMessage.message);
+  }
+
+  return message;
+}
+
+function getMessageContextInfo(message: proto.IMessage | null | undefined) {
+  if (!message) {
+    return undefined;
+  }
+
+  const contentType = getContentType(message);
+  if (!contentType) {
+    return undefined;
+  }
+
+  return (message[contentType] as any)?.contextInfo;
+}
+
+function extractForwardSourceText(message: proto.IMessage | null | undefined) {
+  if (!message) {
+    return undefined;
+  }
+
+  if (typeof message.conversation === 'string' && message.conversation.trim()) {
+    return message.conversation;
+  }
+
+  if (typeof message.extendedTextMessage?.text === 'string' && message.extendedTextMessage.text.trim()) {
+    return message.extendedTextMessage.text;
+  }
+
+  return undefined;
+}
+
+function extractUrlFromText(text: string | undefined) {
+  if (!text) {
+    return undefined;
+  }
+
+  const urlMatch = text.match(/https?:\/\/\S+/i);
+  if (!urlMatch?.[0]) {
+    return undefined;
+  }
+
+  const candidate = urlMatch[0].replace(/[)\]}>,.!?]+$/g, '');
+  return isURL(candidate) ? candidate : undefined;
+}
+
+function isForwardTextSourceMessage(message: proto.IMessage | undefined) {
+  if (!message) {
+    return false;
+  }
+
+  const contentType = getContentType(message);
+  return contentType === 'conversation' || contentType === 'extendedTextMessage';
+}
+
+function summarizeForwardExternalAdReply(externalAdReply: any) {
+  if (!externalAdReply) {
+    return null;
+  }
+
+  return {
+    keys: Object.keys(externalAdReply),
+    hasTitle: Boolean(externalAdReply.title),
+    hasBody: Boolean(externalAdReply.body),
+    hasSourceUrl: Boolean(externalAdReply.sourceUrl),
+    hasMediaUrl: Boolean(externalAdReply.mediaUrl),
+    hasThumbnailUrl: Boolean(externalAdReply.thumbnailUrl),
+    hasJpegThumbnail: Boolean(externalAdReply.jpegThumbnail),
+    jpegThumbnailType: externalAdReply.jpegThumbnail ? typeof externalAdReply.jpegThumbnail : undefined,
+    mediaType: externalAdReply.mediaType,
+    renderLargerThumbnail: externalAdReply.renderLargerThumbnail,
+    showAdAttribution: externalAdReply.showAdAttribution,
+  };
+}
+
+function restoreStoredMessageContextInfo(message: proto.IMessage | null | undefined, storedContextInfo: any) {
+  if (!message || !storedContextInfo || Object.keys(storedContextInfo).length === 0) {
+    return message;
+  }
+
+  if (message.ephemeralMessage?.message) {
+    return {
+      ...message,
+      ephemeralMessage: {
+        ...message.ephemeralMessage,
+        message: restoreStoredMessageContextInfo(message.ephemeralMessage.message, storedContextInfo),
+      },
+    };
+  }
+
+  if (message.viewOnceMessage?.message) {
+    return {
+      ...message,
+      viewOnceMessage: {
+        ...message.viewOnceMessage,
+        message: restoreStoredMessageContextInfo(message.viewOnceMessage.message, storedContextInfo),
+      },
+    };
+  }
+
+  if (message.viewOnceMessageV2?.message) {
+    return {
+      ...message,
+      viewOnceMessageV2: {
+        ...message.viewOnceMessageV2,
+        message: restoreStoredMessageContextInfo(message.viewOnceMessageV2.message, storedContextInfo),
+      },
+    };
+  }
+
+  if (message.viewOnceMessageV2Extension?.message) {
+    return {
+      ...message,
+      viewOnceMessageV2Extension: {
+        ...message.viewOnceMessageV2Extension,
+        message: restoreStoredMessageContextInfo(message.viewOnceMessageV2Extension.message, storedContextInfo),
+      },
+    };
+  }
+
+  if (message.documentWithCaptionMessage?.message) {
+    return {
+      ...message,
+      documentWithCaptionMessage: {
+        ...message.documentWithCaptionMessage,
+        message: restoreStoredMessageContextInfo(message.documentWithCaptionMessage.message, storedContextInfo),
+      },
+    };
+  }
+
+  const contentType = getContentType(message);
+  if (!contentType) {
+    return message;
+  }
+
+  if (contentType === 'conversation') {
+    return {
+      extendedTextMessage: {
+        text: message.conversation,
+        contextInfo: mergeForwardContextInfo(storedContextInfo, undefined),
+      },
+    } as proto.IMessage;
+  }
+
+  const content = message[contentType] as any;
+  if (!content || typeof content !== 'object') {
+    return message;
+  }
+
+  return {
+    ...message,
+    [contentType]: {
+      ...content,
+      contextInfo: mergeForwardContextInfo(storedContextInfo, content.contextInfo),
+    },
+  } as proto.IMessage;
+}
+
+function mergeForwardContextInfo(originalContextInfo: any, generatedContextInfo: any) {
+  const mergedContextInfo = {
+    ...(originalContextInfo ?? {}),
+    ...(generatedContextInfo ?? {}),
+  };
+
+  if (originalContextInfo?.externalAdReply || generatedContextInfo?.externalAdReply) {
+    mergedContextInfo.externalAdReply = {
+      ...(originalContextInfo?.externalAdReply ?? {}),
+      ...(generatedContextInfo?.externalAdReply ?? {}),
+    };
+  }
+
+  return mergedContextInfo;
 }

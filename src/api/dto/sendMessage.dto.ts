@@ -168,8 +168,23 @@ export class SendReactionDto {
   reaction: string;
 }
 
+export class ForwardExternalAdReplyDto {
+  title?: string;
+  body?: string;
+  thumbnail?: string;
+  thumbnailUrl?: string;
+  sourceUrl?: string;
+  mediaUrl?: string;
+  mediaType?: number;
+  showAdAttribution?: boolean;
+  renderLargerThumbnail?: boolean;
+  containsAutoReply?: boolean;
+  jpegThumbnail?: string;
+}
+
 export class ForwardingMessageDto {
   key: proto.IMessageKey;
+  externalAdReply?: ForwardExternalAdReplyDto;
 }
 
 export class SendForwardMessageDto {
